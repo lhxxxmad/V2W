@@ -41,7 +41,7 @@ main.py \
 --do_gauss 0 \
 --sal_predictor mlp \
 --sample_num 4 \
---pseudo_ret_weight 10 \
+--pseudo_ret_weight 1 \
 # --freeze_clip 1
 # --ot_weight 0.1
 
@@ -73,7 +73,7 @@ main.py \
 --do_gauss 0 \
 --sal_predictor mlp \
 --sample_num 4 \
---pseudo_ret_weight 10 \
+--pseudo_ret_weight 1 \
 # --freeze_clip 1
 # --ot_weight 0.1
 

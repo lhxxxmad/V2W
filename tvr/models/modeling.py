@@ -54,6 +54,27 @@ class IM2TEXT(nn.Module):
         for layer in self.layers:
             x = layer(x)
         return self.fc_out(x)
+
+class Text_Inversion(nn.Module):
+    """
+    Textual Inversion Phi network.
+    Takes as input the visual features of an image and outputs the pseudo-work embedding.
+    """
+
+    def __init__(self, input_dim: int, hidden_dim: int, output_dim: int, dropout: int):
+        super().__init__()
+        self.layers = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(p=dropout),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(p=dropout),
+            nn.Linear(hidden_dim, output_dim),
+        )
+
+    def forward(self, x):
+        return self.layers(x)
     
 class SLIP(nn.Module):
     def __init__(self, config):
@@ -203,7 +224,7 @@ class SLIP(nn.Module):
                                                           cross_config.hidden_size)
             if self.agg_module == "seqTransf":
                 self.transformerClip = TransformerClip(width=transformer_width,
-                                                       layers=config.num_hidden_layers//2,
+                                                       layers=config.num_hidden_layers,
                                                        heads=transformer_heads)
             if self.agg_module == "seqLSTM":
                 self.lstm_visual = nn.LSTM(input_size=cross_config.hidden_size, hidden_size=cross_config.hidden_size,
@@ -246,7 +267,7 @@ class SLIP(nn.Module):
         self.max_iter = 100
         self.negative_scale=self.config.negative_scale #1/2000
         self.shift=self.config.shift # 0.1
-
+        # self.img2txt = Text_Inversion(transformer_width, transformer_width, transformer_width, 0.1)
         self.img2txt = IM2TEXT(transformer_width, transformer_width, transformer_width)
 
     def forward(self, text_ids, text_mask, video, video_mask=None, idx=None, global_step=0):
@@ -295,10 +316,10 @@ class SLIP(nn.Module):
             pv_loss_v2p = self.loss_fct(pv_logits.T * logit_scale)
             pv_loss = (pv_loss_p2v + pv_loss_v2p) / 2
 
-            cos_criterion = nn.CosineEmbeddingLoss()
+            # cos_criterion = nn.CosineEmbeddingLoss()
             # target = torch.ones(pseudo_text)
-            target = torch.as_tensor([1]).to(text_feat.device)
-            tp_loss = cos_criterion(pool_text_feat, pool_pseudo_text, target)
+            # target = torch.as_tensor([1]).to(text_feat.device)
+            # tp_loss = cos_criterion(pool_text_feat, pool_pseudo_text, target)
             # tp_loss_t2p = self.loss_fct(tp_logits * logit_scale)
             # tp_loss_p2t = self.loss_fct(tp_logits.T * logit_scale)
             # tp_loss = (tp_loss_t2p + tp_loss_p2t) / 2
@@ -328,12 +349,12 @@ class SLIP(nn.Module):
                                 'dis_cl_loss': dis_cl_loss.item()*self.dist_weight, 
                                 }
             else:
-                final_loss = self.ret_weight * tv_loss + pv_loss + tp_loss
+                final_loss = self.ret_weight * tv_loss + pv_loss #+ tp_loss
                 # final_loss = pv_loss
                 final_loss_dict = {'final_loss': final_loss.item(), 
                                 'tv_loss': tv_loss.item()*self.ret_weight, 
                                 'pv_loss': pv_loss.item()*self.pseudo_ret_weight, 
-                                'tp_loss': tp_loss.item()*self.pseudo_ret_weight, 
+                                # 'tp_loss': tp_loss.item()*self.pseudo_ret_weight, 
                                 }
             
             return final_loss, final_loss_dict
@@ -759,11 +780,11 @@ class SLIP(nn.Module):
                 video = video.view(b * pair * bs * ts, channel, h, w)
         video_feat, image_feat, video_mask = self.get_video_feat(video, video_mask, shaped=True, gauss=gauss)
         # image_feat += torch.rand(image_feat.shape[0], device=image_feat.device).view(-1,1,1)*torch.randn(image_feat.shape, device=image_feat.device)
-        v2w_feat = self.img2txt(image_feat).float()
+        v2w_feat = self.img2txt(video_feat).float()
         # v2w_feat += torch.rand(v2w_feat.shape[0], device=v2w_feat.device).view(-1,1,1)*torch.randn(v2w_feat.shape, device=v2w_feat.device)
         # pdb.set_trace()
         # pseudo_text, pool_pseudo_text,  pseudo_text_mask = self.get_text_feat(v2w_feat, video_mask, shaped=True, gauss=gauss, token_type=True)
-        prompt = tokenize("a video of").type(text_ids.dtype)
+        prompt = tokenize("a video of that").type(text_ids.dtype)
         prompt = prompt[:,:5]
 
         prompt = prompt.to(v2w_feat.device)
