@@ -42,8 +42,8 @@ main.py \
 --sal_predictor mlp \
 --sample_num 4 \
 --pseudo_ret_weight 1 \
---freeze_clip 0 \
---base_encoder ViT-B/32
+--freeze_clip 1 \
+--base_encoder ViT-B/16
 # --ot_weight 0.1
 
 echo "test model"
@@ -75,7 +75,7 @@ main.py \
 --sal_predictor mlp \
 --sample_num 4 \
 --pseudo_ret_weight 1 \
---freeze_clip 0 \
---base_encoder ViT-B/32
+--freeze_clip 1 \
+--base_encoder ViT-B/16
 # --ot_weight 0.1
 

@@ -670,6 +670,52 @@ class CLIP(nn.Module):
 
         return x
 
+    def img_as_text(self, image_token, return_hidden=False, mask=None, text_vec=None):
+        # b_size, text_len = text.size()
+        # collect_ind = text.argmax(dim=-1)
+
+        # x = self.token_embedding(text).type(self.dtype)  # [batch_size, n_ctx, d_model]
+        # if text_vec is not None:
+        #     x = torch.cat([x, text_vec], dim=1).type(self.dtype)
+
+        # pseudo_mask = torch.ones(image_token.size()[0],image_token.size()[1]).to(mask.device)
+        # pseudo_mask = torch.cat([pseudo_mask, mask], dim=1)
+
+        # x = torch.cat([x, image_token], dim=1).type(self.dtype)
+        # for i in range(b_size):
+        #     x[i] = torch.cat([x[i][:collect_ind[i]], x[i][text_len:], x[i][collect_ind[i]:text_len]])
+        #     # x[i] = torch.cat([x[i][:collect_ind[i]], image_token[i], x[i][collect_ind[i]:]])
+        #     # x[i] = torch.cat([x[i][:collect_ind[i]], x[i][collect_ind[i]+1:], x[i][collect_ind[i]:collect_ind[i]+1]])
+
+        x = image_token.type(self.dtype)
+        pseudo_mask = mask
+
+        pos_emd = self.positional_embedding[:x.size(1), :].type(self.dtype)
+        
+        attn_mask = self.build_attention_mask(x.size(1)).repeat(x.size(0), 1, 1).to(mask.device)
+        inf = torch.zeros((x.size(1), x.size(1))).fill_(float("-inf")).repeat(x.size(0), 1, 1).to(mask.device)
+        mask = pseudo_mask.unsqueeze(1).expand(-1, pseudo_mask.size(1), -1)
+        attn_mask = torch.where(mask>0, attn_mask, inf)
+        
+
+        x = x + pos_emd
+        x = x.permute(1, 0, 2)  # NLD -> LND
+        x = self.transformer(x, attn_mask)
+        x = x.permute(1, 0, 2)  # LND -> NLD
+
+        hidden = self.ln_final(x).type(self.dtype) @ self.text_projection
+
+        # x.shape = [batch_size, n_ctx, transformer.width]
+        # take features from the eot embedding (eot_token is the highest number in each sequence)
+
+        # x = hidden[torch.arange(hidden.shape[0]), text.argmax(dim=-1)]
+        x = hidden[torch.arange(hidden.shape[0]), pseudo_mask.sum(-1)]
+
+        if return_hidden:
+            return x.float(), hidden.float(), pseudo_mask
+
+        return x
+
     def img4text(self, text, return_hidden=False, mask=None):
 
         x = self.token_embedding(text).type(self.dtype)  # [batch_size, n_ctx, d_model]

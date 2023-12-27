@@ -142,7 +142,10 @@ class SLIP(nn.Module):
         self.v2w_weight_fc = nn.Sequential(
             nn.Linear(transformer_width, transformer_width), nn.ReLU(inplace=True),
             nn.Linear(transformer_width, 1))
-
+        self.v2w_feat_fc = nn.Sequential(
+            nn.Linear(transformer_width, transformer_width), nn.ReLU(inplace=True),
+            nn.Linear(transformer_width, 1))
+        
         # self.text_saliency_fc = nn.Sequential(
         #     nn.Linear(transformer_width, transformer_width), nn.ReLU(inplace=True),
         #     nn.Linear(transformer_width, config.max_words))
@@ -267,8 +270,8 @@ class SLIP(nn.Module):
         self.max_iter = 100
         self.negative_scale=self.config.negative_scale #1/2000
         self.shift=self.config.shift # 0.1
-        # self.img2txt = Text_Inversion(transformer_width, transformer_width, transformer_width, 0.1)
-        self.img2txt = IM2TEXT(transformer_width, transformer_width, transformer_width)
+        self.img2txt = Text_Inversion(transformer_width, transformer_width*4, transformer_width, 0.1)
+        # self.img2txt = IM2TEXT(transformer_width, transformer_width, transformer_width)
 
     def forward(self, text_ids, text_mask, video, video_mask=None, idx=None, global_step=0):
 
@@ -284,7 +287,7 @@ class SLIP(nn.Module):
             b, pair, bs, ts, channel, h, w = video.shape
             video = video.view(b * pair * bs * ts, channel, h, w)
 
-        text_feat, video_feat, pool_text_feat, text_mask, video_mask, pseudo_text, pool_pseudo_text, pseudo_text_mask = self.get_text_video_feat(text_ids, text_mask, video, video_mask, shaped=True, gauss=self.do_gauss)
+        text_feat, video_feat, pool_text_feat, text_mask, video_mask, pseudo_text, pool_pseudo_text, pseudo_text_mask, v2w_feat = self.get_text_video_feat(text_ids, text_mask, video, video_mask, shaped=True, gauss=self.do_gauss)
 
         if self.training:
             if torch.cuda.is_available():  # batch merge here
@@ -297,6 +300,7 @@ class SLIP(nn.Module):
                 pseudo_text = allgather(pseudo_text, self.config)
                 pool_pseudo_text = allgather(pool_pseudo_text, self.config)
                 pseudo_text_mask = allgather(pseudo_text_mask, self.config)
+                v2w_feat = allgather(v2w_feat, self.config)
                 torch.distributed.barrier()  # force sync
 
             idx = idx.view(-1, 1)
@@ -305,7 +309,7 @@ class SLIP(nn.Module):
             sim_targets = pos_idx / pos_idx.sum(1, keepdim=True)
             
             # loss = 0.
-            tv_logits, pv_logits, tp_logits = self.get_similarity_logits(text_feat, pool_text_feat, text_mask, video_feat, video_mask, pseudo_text, pool_pseudo_text, pseudo_text_mask)
+            tv_logits, pv_logits, tp_logits, t_v2w_logits = self.get_similarity_logits(text_feat, pool_text_feat, text_mask, video_feat, video_mask, pseudo_text, pool_pseudo_text, pseudo_text_mask, v2w_feat)
             logit_scale = self.clip.logit_scale.exp()
 
             tv_loss_t2v = self.loss_fct(tv_logits * logit_scale)
@@ -320,10 +324,14 @@ class SLIP(nn.Module):
             # target = torch.ones(pseudo_text)
             # target = torch.as_tensor([1]).to(text_feat.device)
             # tp_loss = cos_criterion(pool_text_feat, pool_pseudo_text, target)
-            # tp_loss_t2p = self.loss_fct(tp_logits * logit_scale)
-            # tp_loss_p2t = self.loss_fct(tp_logits.T * logit_scale)
-            # tp_loss = (tp_loss_t2p + tp_loss_p2t) / 2
+            tp_loss_t2p = self.loss_fct(tp_logits * logit_scale)
+            tp_loss_p2t = self.loss_fct(tp_logits.T * logit_scale)
+            tp_loss = (tp_loss_t2p + tp_loss_p2t) / 2
             
+
+            t_v2w_loss_t2p = self.loss_fct(t_v2w_logits * logit_scale)
+            t_v2w_loss_p2t = self.loss_fct(t_v2w_logits.T * logit_scale)
+            t_v2w_loss = (t_v2w_loss_t2p + t_v2w_loss_p2t) / 2
 
             # retrieval_loss, text_weight, video_weight, txt_mu, txt_logsigma, vid_mu, vid_logsigma, dis_text_feat, dis_video_feat = self.get_similarity_loss(text_feat, pool_text_feat, video_feat, text_mask, video_mask,shaped=True,v2w=False)
             # pseudo_retrieval_loss1, *_ = self.get_similarity_loss(pseudo_text, pool_pseudo_text, video_feat, pseudo_text_mask, video_mask,shaped=True,v2w=True)
@@ -349,11 +357,12 @@ class SLIP(nn.Module):
                                 'dis_cl_loss': dis_cl_loss.item()*self.dist_weight, 
                                 }
             else:
-                final_loss = self.ret_weight * tv_loss + pv_loss #+ tp_loss
+                final_loss = self.ret_weight * tv_loss + pv_loss*self.pseudo_ret_weight + t_v2w_loss #+ tp_loss
                 # final_loss = pv_loss
                 final_loss_dict = {'final_loss': final_loss.item(), 
                                 'tv_loss': tv_loss.item()*self.ret_weight, 
                                 'pv_loss': pv_loss.item()*self.pseudo_ret_weight, 
+                                't_v2w_loss': t_v2w_loss.item()
                                 # 'tp_loss': tp_loss.item()*self.pseudo_ret_weight, 
                                 }
             
@@ -486,7 +495,7 @@ class SLIP(nn.Module):
         p2 = torch.sum(torch.pow(sigma1 - sigma2, 2), dim=-1)
         return p1+p2, p1
     
-    def get_wti(self, text_feat, text_mask, text_weight, video_feat, video_mask, video_weight):
+    def forward_wti(self, text_feat, text_mask, text_weight, video_feat, video_mask, video_weight):
 
         retrieve_logits = torch.einsum('atd,bvd->abtv', [text_feat, video_feat])
         retrieve_logits = torch.einsum('abtv,at->abtv', [retrieve_logits, text_mask])
@@ -503,10 +512,11 @@ class SLIP(nn.Module):
 
         return retrieve_logits
 
-    def get_similarity_logits(self, text_feat, pool_text_feat, text_mask, video_feat, video_mask, pseudo_text, pool_pseudo_text, pseudo_text_mask):
+    def get_similarity_logits(self, text_feat, pool_text_feat, text_mask, video_feat, video_mask, pseudo_text, pool_pseudo_text, pseudo_text_mask, v2w_feat):
         pseudo_text_weight = self.v2w_weight_fc(pseudo_text).squeeze(2)  # B_t x N_t x D -> B_t x N_t
         text_weight = self.dist_text_weight_fc(text_feat).squeeze(2)  # B_t x N_t x D -> B_t x N_t
         video_weight = self.dist_video_weight_fc(video_feat).squeeze(2) # B_v x N_v x D -> B_v x N_v
+        v2w_feat_weight = self.v2w_feat_fc(v2w_feat).squeeze(2) # B_v x N_v x D -> B_v x N_v
 
         pseudo_text_weight.masked_fill_(torch.tensor((1 - pseudo_text_mask), dtype=torch.bool), float("-inf"))
         pseudo_text_weight = torch.softmax(pseudo_text_weight, dim=-1)  # B_t x N_t
@@ -523,16 +533,18 @@ class SLIP(nn.Module):
         text_feat = text_feat / text_feat.norm(dim=-1, keepdim=True)
         video_feat = video_feat / video_feat.norm(dim=-1, keepdim=True)         
 
-        tv_logits = self.get_wti(text_feat, text_mask, text_weight, video_feat, video_mask, video_weight)
+        tv_logits = self.forward_wti(text_feat, text_mask, text_weight, video_feat, video_mask, video_weight)
         # video_feat = self._mean_pooling_for_similarity_visual(video_feat, video_mask)
         # video_feat = video_feat / video_feat.norm(dim=-1, keepdim=True) 
         # pv_logits = 
-        pv_logits = self.get_wti(pseudo_text, pseudo_text_mask, pseudo_text_weight, video_feat, video_mask, video_weight)
+        pv_logits = self.forward_wti(pseudo_text, pseudo_text_mask, pseudo_text_weight, video_feat, video_mask, video_weight)
         # tp_logits = None
-        tp_logits = self.get_wti(text_feat, text_mask, text_weight, pseudo_text, pseudo_text_mask, pseudo_text_weight)
+        tp_logits = self.forward_wti(text_feat, text_mask, text_weight, pseudo_text, pseudo_text_mask, pseudo_text_weight)
+
+        t_v2w_logits = self.forward_wti(text_feat, text_mask, text_weight, v2w_feat, video_mask, v2w_feat_weight)
         # if self.training:
         #     return tv_logits, pv_logits, tp_logits
-        return tv_logits, pv_logits, tp_logits
+        return tv_logits, pv_logits, tp_logits, t_v2w_logits
 
     def Sinkhorn(self, K, u, v):
         r = torch.ones_like(u)
@@ -779,12 +791,15 @@ class SLIP(nn.Module):
                 b, pair, bs, ts, channel, h, w = video.shape
                 video = video.view(b * pair * bs * ts, channel, h, w)
         video_feat, image_feat, video_mask = self.get_video_feat(video, video_mask, shaped=True, gauss=gauss)
-        # image_feat += torch.rand(image_feat.shape[0], device=image_feat.device).view(-1,1,1)*torch.randn(image_feat.shape, device=image_feat.device)
-        v2w_feat = self.img2txt(video_feat).float()
+        # visual_token = video_feat + torch.rand(video_feat.shape[0], device=video_feat.device).view(-1,1,1)*torch.randn(video_feat.shape, device=video_feat.device)
+        visual_token = video_feat
+        # visual_token = self._mean_pooling_for_similarity_visual(video_feat, video_mask).unsqueeze(1)
+        v2w_feat = self.img2txt(visual_token).float()
         # v2w_feat += torch.rand(v2w_feat.shape[0], device=v2w_feat.device).view(-1,1,1)*torch.randn(v2w_feat.shape, device=v2w_feat.device)
         # pdb.set_trace()
         # pseudo_text, pool_pseudo_text,  pseudo_text_mask = self.get_text_feat(v2w_feat, video_mask, shaped=True, gauss=gauss, token_type=True)
-        prompt = tokenize("a video of that").type(text_ids.dtype)
+        # prompt = tokenize("a video of ").type(text_ids.dtype)
+        prompt = tokenize("a video that ").type(text_ids.dtype)
         prompt = prompt[:,:5]
 
         prompt = prompt.to(v2w_feat.device)
@@ -794,10 +809,11 @@ class SLIP(nn.Module):
         pseudo_mask = torch.ones(prompt.size()[0],5).to(v2w_feat.device)
         # text_features = self.clip.encode_text_img(prompt, v2w_feat)
         # pool_pseudo_text, pseudo_text,  pseudo_text_mask= self.clip.img2text(prompt, v2w_feat, return_hidden=True, mask=pseudo_mask)
+        # pool_pseudo_text, pseudo_text,  pseudo_text_mask = self.clip.img_as_text(v2w_feat, return_hidden=True, mask=video_mask.type(text_ids.dtype))
         pool_pseudo_text, pseudo_text,  pseudo_text_mask= self.clip.img2text(text_ids, v2w_feat, return_hidden=True, mask=text_mask)
         text_feat, pool_text_feat, text_mask = self.get_text_feat(text_ids, text_mask, shaped=True, gauss=gauss)
         
-        return text_feat, video_feat, pool_text_feat, text_mask, video_mask, pseudo_text, pool_pseudo_text, pseudo_text_mask
+        return text_feat, video_feat, pool_text_feat, text_mask, video_mask, pseudo_text, pool_pseudo_text, pseudo_text_mask, v2w_feat
 
     def generate_gauss_weight(self, props_len, center, width):
 

@@ -374,7 +374,7 @@ def train_epoch(epoch, args, model, train_dataloader, device, n_gpu, optimizer,
     return total_loss, global_step
 
 
-def _run_on_single_gpu(model, t_mask_list, v_mask_list, t_feat_list, v_feat_list, cls_list, pt_list, pool_pt_list, pt_mask_list, mini_batch=32):
+def _run_on_single_gpu(model, t_mask_list, v_mask_list, t_feat_list, v_feat_list, cls_list, pt_list, pool_pt_list, pt_mask_list, v2w_list, mini_batch=32):
     sim_matrix = []
     logger.info('[finish] map to main gpu')
 
@@ -386,13 +386,14 @@ def _run_on_single_gpu(model, t_mask_list, v_mask_list, t_feat_list, v_feat_list
     batch_pt = torch.split(pt_list, mini_batch)
     batch_pool_pt = torch.split(pool_pt_list, mini_batch)
     batch_pt_mask = torch.split(pt_mask_list, mini_batch)
+    batch_v2w = torch.split(v2w_list, mini_batch)
 
     logger.info('[finish] map to main gpu')
     with torch.no_grad():
         for idx1, (t_mask, t_feat, cls) in enumerate(zip(batch_t_mask, batch_t_feat, batch_cls_feat)):
             each_row = []
-            for idx2, (v_mask, v_feat, p_feat, pp_feat, p_mask) in enumerate(zip(batch_v_mask, batch_v_feat, batch_pt, batch_pool_pt, batch_pt_mask)):
-                tv_logits, pv_logits, tp_logits = model.get_similarity_logits(t_feat, cls, t_mask, v_feat, v_mask, p_feat, pp_feat, p_mask)
+            for idx2, (v_mask, v_feat, p_feat, pp_feat, p_mask, v2w_feat) in enumerate(zip(batch_v_mask, batch_v_feat, batch_pt, batch_pool_pt, batch_pt_mask, batch_v2w)):
+                tv_logits, pv_logits, tp_logits, t_v2w_logits = model.get_similarity_logits(t_feat, cls, t_mask, v_feat, v_mask, p_feat, pp_feat, p_mask, v2w_feat)
                 logits = tv_logits #+ tp_logits
                 logits = logits.cpu().detach().numpy()
                 each_row.append(logits)
@@ -436,7 +437,7 @@ def eval_epoch(args, model, test_dataloader, device):
     # ----------------------------
     batch_mask_t, batch_mask_v, batch_feat_t, batch_feat_v, ids_t, ids_v = [], [], [], [], [], []
     batch_cls = []
-    batch_pt, batch_pool_pt, batch_pt_mask = [], [], []
+    batch_pt, batch_pool_pt, batch_pt_mask, batch_v2w = [], [], [], []
 
     with torch.no_grad():
         tic = time.time()
@@ -482,7 +483,7 @@ def eval_epoch(args, model, test_dataloader, device):
             for batch in tqdm(test_dataloader):
                 batch = tuple(t.to(device) for t in batch)
                 text_ids, text_mask, video, video_mask, inds, _ = batch
-                text_feat, video_feat, cls, text_mask, video_mask, pseudo_text, pool_pseudo_text, pseudo_text_mask = model.get_text_video_feat(text_ids, text_mask, video, video_mask, gauss=args.do_gauss)
+                text_feat, video_feat, cls, text_mask, video_mask, pseudo_text, pool_pseudo_text, pseudo_text_mask, v2w_feat = model.get_text_video_feat(text_ids, text_mask, video, video_mask, gauss=args.do_gauss)
                 ids_t.append(inds)
                 batch_mask_t.append(text_mask)
                 batch_mask_v.append(video_mask)
@@ -492,6 +493,7 @@ def eval_epoch(args, model, test_dataloader, device):
                 batch_pt.append(pseudo_text)
                 batch_pool_pt.append(pool_pseudo_text)
                 batch_pt_mask.append(pseudo_text_mask)
+                batch_v2w.append(v2w_feat)
             ids_t = allgather(torch.cat(ids_t, dim=0), args).squeeze()
             batch_mask_t = allgather(torch.cat(batch_mask_t, dim=0), args)
             batch_mask_v = allgather(torch.cat(batch_mask_v, dim=0), args)
@@ -501,6 +503,7 @@ def eval_epoch(args, model, test_dataloader, device):
             batch_pt = allgather(torch.cat(batch_pt, dim=0), args)
             batch_pool_pt = allgather(torch.cat(batch_pool_pt, dim=0), args)
             batch_pt_mask = allgather(torch.cat(batch_pt_mask, dim=0), args)
+            batch_v2w = allgather(torch.cat(batch_v2w, dim=0), args)
 
             batch_mask_t[ids_t] = batch_mask_t.clone()
             batch_mask_v[ids_t] = batch_mask_v.clone()
@@ -510,6 +513,7 @@ def eval_epoch(args, model, test_dataloader, device):
             batch_pt[ids_t] = batch_pt.clone()
             batch_pool_pt[ids_t] = batch_pool_pt.clone()
             batch_pt_mask[ids_t] = batch_pt_mask.clone()
+            batch_v2w[ids_t] = batch_v2w.clone()
 
             batch_mask_t = batch_mask_t[:ids_t.max() + 1, ...]
             batch_mask_v = batch_mask_v[:ids_t.max() + 1, ...]
@@ -519,6 +523,7 @@ def eval_epoch(args, model, test_dataloader, device):
             batch_pt = batch_pt[:ids_t.max() + 1, ...]
             batch_pool_pt = batch_pool_pt[:ids_t.max() + 1, ...]
             batch_pt_mask = batch_pt_mask[:ids_t.max() + 1, ...]
+            batch_v2w = batch_v2w[:ids_t.max() + 1, ...]
             logger.info('[finish] extract text+video feature')
 
     toc1 = time.time()
@@ -530,7 +535,7 @@ def eval_epoch(args, model, test_dataloader, device):
     logger.info('[start] calculate the similarity')
     with torch.no_grad():
         sim_matrix = _run_on_single_gpu(model, batch_mask_t, batch_mask_v, batch_feat_t, batch_feat_v,
-                                                      batch_cls, batch_pt, batch_pool_pt, batch_pt_mask)
+                                                      batch_cls, batch_pt, batch_pool_pt, batch_pt_mask, batch_v2w)
         sim_matrix = np.concatenate(tuple(sim_matrix), axis=0)
     logger.info('[end] calculate the similarity')
 
